@@ -31,6 +31,16 @@ The Pages workflow builds a static export on every push to `main`. In repository
 
 Video is processed locally. Raw frames and video are not saved or uploaded. Only aggregated numeric windows exist in memory until the tab is closed or the user exports a CSV.
 
+## Facial Expression Analysis
+
+MediaPipe Face Landmarker blendshapes are processed locally to describe an experimental **Facial Expression State**. It is not a reading of internal emotion.
+
+- **快・不快 (Valence)**: -1.0 to +1.0, derived from smile (+1.45), frown (-1.15), and brow-tension (-0.35) feature weights.
+- **沈静・興奮 (Facial Arousal)**: 0.0 to 1.0, derived from jaw opening (0.60), eye opening (0.40), brow raise (0.22), and mouth tension (0.18).
+- Six heuristic categories: 😊 快・活性, 😌 リラックス, 😐 中立, 😢 悲しみ様, 😠 緊張・怒り様, and 😮 驚き・高覚醒.
+
+The classifier uses explicit multi-feature rules and EMA/majority-vote smoothing, records research samples at 1 Hz, and reports 30-second mean, SD, category ratios, and dominant expression. Thresholds and weights live in `lib/expressionConfig.ts` for research adjustment. TODO: personal facial baseline normalization.
+
 ## Limitations
 
 - Experimental research/education demo; not a medical or diagnostic device.

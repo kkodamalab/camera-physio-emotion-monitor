@@ -1,126 +1,19 @@
 "use client";
 
+import { FaceLandmarker, FilesetResolver } from "@mediapipe/tasks-vision";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 type Quality = "Good" | "Moderate" | "Poor";
 type Sample = { t: number; r: number; g: number; b: number };
-type WindowRow = {
-  timestamp: string; window_number: number; estimated_HR: number | null;
-  physiological_arousal_index: number | null; signal_quality: Quality;
-  valence_mean: number | null; valence_sd: number | null;
-  facial_arousal_mean: number | null; facial_arousal_sd: number | null;
-};
-
-const WINDOW_SECONDS = 30;
-const fmt = (v: number | null, digits = 0) => v == null ? "—" : v.toFixed(digits);
-const mean = (a: number[]) => a.length ? a.reduce((s, v) => s + v, 0) / a.length : 0;
-const sd = (a: number[]) => { const m = mean(a); return a.length ? Math.sqrt(mean(a.map(v => (v - m) ** 2))) : 0; };
-
-function estimatePulse(samples: Sample[]) {
-  if (samples.length < 80) return { hr: null as number | null, quality: "Poor" as Quality, wave: [] as number[], dominant: null as number | null };
-  const duration = (samples.at(-1)!.t - samples[0].t) / 1000;
-  const fps = samples.length / Math.max(duration, 1);
-  const rs = samples.map(s => s.r), gs = samples.map(s => s.g), bs = samples.map(s => s.b);
-  const mr = mean(rs), mg = mean(gs), mb = mean(bs);
-  const x = samples.map((_, i) => (gs[i] / mg - bs[i] / mb));
-  const y = samples.map((_, i) => (gs[i] / mg + bs[i] / mb - 2 * rs[i] / mr));
-  const alpha = sd(x) / Math.max(sd(y), 1e-6);
-  let raw = x.map((v, i) => v + alpha * y[i]);
-  const trendN = Math.max(3, Math.round(fps * .7));
-  raw = raw.map((v, i) => v - mean(raw.slice(Math.max(0, i - trendN), Math.min(raw.length, i + trendN))));
-  const wave = raw.map((_, i) => mean(raw.slice(Math.max(0, i - 2), Math.min(raw.length, i + 3))));
-  let bestAmp = 0, dominant = 0;
-  for (let bpm = 42; bpm <= 180; bpm += 1) {
-    const f = bpm / 60; let re = 0, im = 0;
-    for (let i = 0; i < wave.length; i++) { const a = 2 * Math.PI * f * i / fps; re += wave[i] * Math.cos(a); im -= wave[i] * Math.sin(a); }
-    const amp = Math.hypot(re, im);
-    if (amp > bestAmp) { bestAmp = amp; dominant = f; }
-  }
-  const noise = Math.sqrt(mean(wave.map(v => v * v))) * Math.sqrt(wave.length);
-  const snr = bestAmp / Math.max(noise, 1e-8);
-  const quality: Quality = duration < 8 || snr < 1.8 ? "Poor" : snr < 3.2 ? "Moderate" : "Good";
-  return { hr: quality === "Poor" ? null : Math.round(dominant * 60), quality, wave: wave.slice(-180), dominant };
-}
-
-function Sparkline({ values, color = "#52e7c0" }: { values: number[]; color?: string }) {
-  if (values.length < 2) return <div className="spark-empty">Signal trace will appear here</div>;
-  const lo = Math.min(...values), hi = Math.max(...values), span = hi - lo || 1;
-  const points = values.map((v, i) => `${i / (values.length - 1) * 100},${34 - (v - lo) / span * 30}`).join(" ");
-  return <svg className="spark" viewBox="0 0 100 36" preserveAspectRatio="none" aria-label="Signal waveform"><polyline points={points} fill="none" stroke={color} strokeWidth="1.4" vectorEffect="non-scaling-stroke" /></svg>;
-}
-
-export default function Home() {
-  const videoRef = useRef<HTMLVideoElement>(null), overlayRef = useRef<HTMLCanvasElement>(null), sampleCanvas = useRef<HTMLCanvasElement | null>(null);
-  const streamRef = useRef<MediaStream | null>(null), samplesRef = useRef<Sample[]>([]), emotionRef = useRef<{t:number;v:number;a:number}[]>([]);
-  const [running, setRunning] = useState(false), [status, setStatus] = useState("Camera idle"), [face, setFace] = useState(false);
-  const [elapsed, setElapsed] = useState(0), [hr, setHr] = useState<number|null>(null), [quality, setQuality] = useState<Quality>("Poor");
-  const [arousal, setArousal] = useState<number|null>(null), [wave, setWave] = useState<number[]>([]), [dominant, setDominant] = useState<number|null>(null);
-  const [rows, setRows] = useState<WindowRow[]>([]), [debug, setDebug] = useState(false), [fps, setFps] = useState(0);
-  const facialAvailable = false;
-  const next = WINDOW_SECONDS - (elapsed % WINDOW_SECONDS || (elapsed ? WINDOW_SECONDS : 0));
-
-  const stop = useCallback(() => { streamRef.current?.getTracks().forEach(t => t.stop()); streamRef.current = null; setRunning(false); setFace(false); setStatus("Camera idle"); }, []);
-
-  const start = useCallback(async () => {
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "user", width: { ideal: 720 }, height: { ideal: 1280 }, frameRate: { ideal: 30 } }, audio: false });
-      streamRef.current = stream; if (videoRef.current) { videoRef.current.srcObject = stream; await videoRef.current.play(); }
-      samplesRef.current = []; emotionRef.current = []; setElapsed(0); setRows([]); setRunning(true); setStatus("Camera ready · Analyzing");
-    } catch { setStatus("Camera permission unavailable"); }
-  }, []);
-
-  useEffect(() => () => stop(), [stop]);
-  useEffect(() => {
-    if (!running) return;
-    let raf = 0, last = performance.now(), frames = 0, lastFps = last;
-    const tick = async (now: number) => {
-      raf = requestAnimationFrame(tick); const video = videoRef.current, canvas = overlayRef.current;
-      if (!video || !canvas || video.readyState < 2 || now - last < 65) return; last = now; frames++;
-      if (now - lastFps > 1000) { setFps(Math.round(frames * 1000 / (now - lastFps))); frames = 0; lastFps = now; }
-      canvas.width = video.videoWidth; canvas.height = video.videoHeight; const ctx = canvas.getContext("2d")!; ctx.clearRect(0,0,canvas.width,canvas.height);
-      const w = canvas.width * .42, h = canvas.height * .34, x = (canvas.width - w)/2, y = canvas.height * .18;
-      ctx.strokeStyle = "#52e7c0"; ctx.lineWidth = Math.max(3, canvas.width/180); ctx.setLineDash([18,12]); ctx.strokeRect(x,y,w,h);
-      const roi = { x:x+w*.22, y:y+h*.08, w:w*.56, h:h*.20 }; ctx.setLineDash([]); ctx.strokeStyle="#d7ff62"; ctx.strokeRect(roi.x,roi.y,roi.w,roi.h);
-      if (!sampleCanvas.current) sampleCanvas.current = document.createElement("canvas"); const sc = sampleCanvas.current; sc.width=32; sc.height=16;
-      const sctx=sc.getContext("2d",{willReadFrequently:true})!; sctx.drawImage(video,roi.x,roi.y,roi.w,roi.h,0,0,32,16); const data=sctx.getImageData(0,0,32,16).data;
-      let r=0,g=0,b=0,n=0; for(let i=0;i<data.length;i+=4){ if(data[i+3]){r+=data[i];g+=data[i+1];b+=data[i+2];n++;} }
-      r/=n; g/=n; b/=n; const luminance=.2126*r+.7152*g+.0722*b; const detected=luminance>35&&luminance<240&&Math.max(r,g,b)-Math.min(r,g,b)>4;
-      setFace(detected); setStatus(detected?"Face detected · Analyzing":"Face not detected · Align with guide");
-      const t=Date.now(); if(detected) samplesRef.current.push({t,r,g,b}); samplesRef.current=samplesRef.current.filter(s=>t-s.t<=32000);
-    }; raf=requestAnimationFrame(tick); return()=>cancelAnimationFrame(raf);
-  },[running]);
-
-  useEffect(() => {
-    if (!running) return; const started=Date.now();
-    const id=setInterval(()=>{
-      const e=Math.floor((Date.now()-started)/1000); setElapsed(e); const result=estimatePulse(samplesRef.current); setHr(result.hr); setQuality(result.quality); setWave(result.wave); setDominant(result.dominant);
-      if(result.hr!=null){ const centered=Math.abs(result.hr-70); setArousal(Math.max(0,Math.min(100,Math.round(35+centered*.8)))); } else setArousal(null);
-      if(e>0 && e%WINDOW_SECONDS===0){
-        setRows(prev=>{ if(prev.at(-1)?.window_number===e/WINDOW_SECONDS)return prev; const q=result.quality; const row:WindowRow={timestamp:new Date().toISOString(),window_number:e/WINDOW_SECONDS,estimated_HR:result.hr,physiological_arousal_index:q==="Poor"?null:(result.hr==null?null:Math.max(0,Math.min(100,Math.round(35+Math.abs(result.hr-70)*.8)))),signal_quality:q,valence_mean:null,valence_sd:null,facial_arousal_mean:null,facial_arousal_sd:null}; return [...prev,row].slice(-40); });
-      }
-    },1000); return()=>clearInterval(id);
-  },[running]);
-
-  const exportCsv=()=>{ const headers=["timestamp","window_number","estimated_HR","physiological_arousal_index","signal_quality","valence_mean","valence_sd","facial_arousal_mean","facial_arousal_sd"]; const lines=[headers.join(","),...rows.map(r=>headers.map(h=>String(r[h as keyof WindowRow]??"")).join(","))]; const a=document.createElement("a"); a.href=URL.createObjectURL(new Blob([lines.join("\n")],{type:"text/csv"})); a.download=`pulse-lens-${new Date().toISOString().slice(0,10)}.csv`; a.click(); URL.revokeObjectURL(a.href); };
-  const chartValues=useMemo(()=>rows.map(r=>r.physiological_arousal_index??0),[rows]);
-
-  return <main>
-    <header><div className="brand"><span className="mark">P</span><div><strong>Pulse Lens</strong><small>CAMERA PHYSIO LAB</small></div></div><button className="icon-btn" onClick={()=>setDebug(v=>!v)} aria-pressed={debug}>DEBUG {debug?"ON":"OFF"}</button></header>
-    <section className="hero"><div><p className="eyebrow">LIVE · ON-DEVICE ANALYSIS</p><h1>Your signals,<br/><em>made visible.</em></h1><p className="intro">An experimental lens on pulse dynamics and facial expression—processed privately in your browser.</p></div><div className="privacy"><span>●</span> Video stays on this device</div></section>
-    <section className="camera-card">
-      <div className="camera-stage"><video ref={videoRef} muted playsInline/><canvas ref={overlayRef}/>{!running&&<div className="camera-empty"><span>◎</span><b>Ready when you are</b><small>Position your face in natural, steady light</small></div>}<div className={`status ${face?"ok":""}`}><i/>{status}</div><div className="roi-label">FOREHEAD ROI</div></div>
-      <div className="camera-actions"><button className="primary" onClick={running?stop:start}>{running?"Stop session":"Start camera"}</button><span>{running?`${String(Math.floor(elapsed/60)).padStart(2,"0")}:${String(elapsed%60).padStart(2,"0")}`:"Local processing"}</span></div>
-    </section>
-    <section className="section-head"><div><p className="eyebrow">CURRENT READINGS</p><h2>Live signals</h2></div><div className={`quality q-${quality.toLowerCase()}`}>{quality} signal</div></section>
-    <section className="metrics">
-      <article className="metric featured"><label>ESTIMATED HEART RATE</label><div><strong>{fmt(hr)}</strong><span>bpm</span></div><Sparkline values={wave}/><small>{quality==="Poor"?"Insufficient signal — hold still in even light":"POS-derived pulse estimate"}</small></article>
-      <article className="metric"><label>PHYSIOLOGICAL AROUSAL</label><div><strong>{fmt(arousal)}</strong><span>/ 100</span></div><div className="meter"><i style={{width:`${arousal??0}%`}}/></div><small>Experimental index · not stress</small></article>
-      <article className="metric"><label>FACIAL VALENCE</label><div><strong>—</strong></div><small>Experimental / unavailable</small></article>
-      <article className="metric"><label>FACIAL AROUSAL</label><div><strong>—</strong></div><small>Experimental / unavailable</small></article>
-    </section>
-    <section className="window"><div><p className="eyebrow">30-SECOND WINDOW</p><h2>Expression dynamics</h2></div><div className="countdown"><span>{running?next:30}</span><small>SEC TO NEXT<br/>ANALYSIS</small></div><div className="window-grid">{[["Valence mean",null],["Valence SD",null],["Arousal mean",null],["Arousal SD",null]].map(([l,v])=><div key={l as string}><label>{l}</label><b>{fmt(v as number|null,2)}</b></div>)}</div><p className="unavailable">Facial model is not bundled in this honest MVP; values remain unavailable rather than simulated.</p></section>
-    <section className="history"><div className="section-head"><div><p className="eyebrow">SESSION HISTORY</p><h2>Window timeline</h2></div><button className="secondary" onClick={exportCsv} disabled={!rows.length}>Export CSV</button></div><div className="chart"><Sparkline values={chartValues} color="#d7ff62"/>{!rows.length&&<p>Completed 30-second windows will appear here.</p>}</div></section>
-    {debug&&<section className="debug"><p className="eyebrow">RESEARCH DEBUG</p><h2>Signal inspector</h2><div className="debug-grid"><div><label>FPS</label><b>{fps}</b></div><div><label>Face confidence</label><b>{face?"ROI heuristic":"—"}</b></div><div><label>Samples</label><b>{samplesRef.current.length}</b></div><div><label>Dominant frequency</label><b>{dominant?`${dominant.toFixed(2)} Hz`:"—"}</b></div><div><label>Signal quality</label><b>{quality}</b></div><div><label>Pulse intervals</label><b>{hr?`${Math.round(60000/hr)} ms`:"—"}</b></div></div><Sparkline values={wave}/></section>}
-    <footer><p>Experimental research/education demo. Not a medical or diagnostic device.</p><small>Camera-derived signals are sensitive to lighting, movement, skin visibility, camera quality and frame rate. No video is saved or uploaded.</small></footer>
-  </main>;
-}
+type Emotion = { t: number; v: number; a: number; label: string };
+type Row = { timestamp:string; window_number:number; estimated_HR:number|null; physiological_arousal_index:number|null; signal_quality:Quality; valence_mean:number|null; valence_sd:number|null; facial_arousal_mean:number|null; facial_arousal_sd:number|null };
+const MODEL="https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/latest/face_landmarker.task";
+const WASM="https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.34/wasm";
+const m=(a:number[])=>a.length?a.reduce((s,x)=>s+x,0)/a.length:0; const s=(a:number[])=>{const q=m(a);return a.length?Math.sqrt(m(a.map(x=>(x-q)**2))):0}; const clamp=(x:number,l:number,h:number)=>Math.max(l,Math.min(h,x)); const f=(x:number|null,d=0)=>x==null?"—":x.toFixed(d);
+function pulse(samples:Sample[]){if(samples.length<80)return{hr:null as number|null,q:"Poor" as Quality,w:[] as number[],hz:null as number|null};const duration=(samples.at(-1)!.t-samples[0].t)/1000,fps=samples.length/Math.max(duration,1),r=samples.map(x=>x.r),g=samples.map(x=>x.g),b=samples.map(x=>x.b),mr=m(r),mg=m(g),mb=m(b),x=samples.map((_,i)=>g[i]/mg-b[i]/mb),y=samples.map((_,i)=>g[i]/mg+b[i]/mb-2*r[i]/mr),a=s(x)/Math.max(s(y),1e-6);let w=x.map((v,i)=>v+a*y[i]);const n=Math.max(3,Math.round(fps*.7));w=w.map((v,i)=>v-m(w.slice(Math.max(0,i-n),Math.min(w.length,i+n))));w=w.map((_,i)=>m(w.slice(Math.max(0,i-2),Math.min(w.length,i+3))));let amp=0,hz=0;for(let bpm=42;bpm<=180;bpm++){const h=bpm/60;let re=0,im=0;for(let i=0;i<w.length;i++){const z=2*Math.PI*h*i/fps;re+=w[i]*Math.cos(z);im-=w[i]*Math.sin(z)}const z=Math.hypot(re,im);if(z>amp){amp=z;hz=h}}const snr=amp/Math.max(Math.sqrt(m(w.map(v=>v*v)))*Math.sqrt(w.length),1e-8),q:Quality=duration<8||snr<1.8?"Poor":snr<3.2?"Moderate":"Good";return{hr:q==="Poor"?null:Math.round(hz*60),q,w:w.slice(-180),hz}}
+function Trace({v,c="#52e7c0"}:{v:number[];c?:string}){if(v.length<2)return <div className="spark-empty">Signal trace will appear here</div>;const lo=Math.min(...v),hi=Math.max(...v),span=hi-lo||1,p=v.map((x,i)=>`${i/(v.length-1)*100},${34-(x-lo)/span*30}`).join(" ");return <svg className="spark" viewBox="0 0 100 36" preserveAspectRatio="none"><polyline points={p} fill="none" stroke={c} strokeWidth="1.4" vectorEffect="non-scaling-stroke"/></svg>}
+export default function Home(){const video=useRef<HTMLVideoElement>(null),canvas=useRef<HTMLCanvasElement>(null),sampler=useRef<HTMLCanvasElement|null>(null),model=useRef<FaceLandmarker|null>(null),stream=useRef<MediaStream|null>(null),rgb=useRef<Sample[]>([]),emotions=useRef<Emotion[]>([]),last=useRef(0);const[running,setRunning]=useState(false),[status,setStatus]=useState("Camera idle"),[modelStatus,setModelStatus]=useState("Model not loaded"),[face,setFace]=useState(false),[elapsed,setElapsed]=useState(0),[hr,setHr]=useState<number|null>(null),[quality,setQuality]=useState<Quality>("Poor"),[phys,setPhys]=useState<number|null>(null),[wave,setWave]=useState<number[]>([]),[hz,setHz]=useState<number|null>(null),[valence,setValence]=useState<number|null>(null),[facial,setFacial]=useState<number|null>(null),[expression,setExpression]=useState("—"),[rows,setRows]=useState<Row[]>([]),[debug,setDebug]=useState(false),[fps,setFps]=useState(0);const next=30-(elapsed%30||(elapsed?30:0));
+const load=useCallback(async()=>{if(model.current)return true;try{setModelStatus("Loading facial landmarks…");const vision=await FilesetResolver.forVisionTasks(WASM);model.current=await FaceLandmarker.createFromOptions(vision,{baseOptions:{modelAssetPath:MODEL},runningMode:"VIDEO",numFaces:1,outputFaceBlendshapes:true});setModelStatus("Face landmarks active");return true}catch{setModelStatus("Facial model unavailable");return false}},[]);const stop=useCallback(()=>{stream.current?.getTracks().forEach(t=>t.stop());stream.current=null;setRunning(false);setFace(false);setStatus("Camera idle")},[]);const start=useCallback(async()=>{try{const st=await navigator.mediaDevices.getUserMedia({video:{facingMode:"user",width:{ideal:1280},height:{ideal:720},frameRate:{ideal:30}},audio:false});stream.current=st;if(video.current){video.current.srcObject=st;await video.current.play()}rgb.current=[];emotions.current=[];setElapsed(0);setRows([]);setRunning(true);setStatus("Camera ready · Loading face model");void load()}catch{setStatus("Camera permission unavailable")}},[load]);useEffect(()=>()=>{stop();model.current?.close()},[stop]);
+useEffect(()=>{if(!running)return;let raf=0,prev=performance.now(),frames=0,lastFps=prev;const tick=(now:number)=>{raf=requestAnimationFrame(tick);const v=video.current,c=canvas.current;if(!v||!c||v.readyState<2||now-prev<66)return;prev=now;frames++;if(now-lastFps>1000){setFps(Math.round(frames*1000/(now-lastFps)));frames=0;lastFps=now}c.width=v.videoWidth;c.height=v.videoHeight;const ctx=c.getContext("2d")!;ctx.clearRect(0,0,c.width,c.height);if(!model.current||now-last.current<120)return;last.current=now;const result=model.current.detectForVideo(v,now),lm=result.faceLandmarks[0];if(!lm){setFace(false);setStatus("Face not detected · Align with guide");return}const xs=lm.map(p=>p.x*c.width),ys=lm.map(p=>p.y*c.height),minX=Math.min(...xs),maxX=Math.max(...xs),minY=Math.min(...ys),maxY=Math.max(...ys),fw=maxX-minX,fh=maxY-minY,roi={x:minX+fw*.25,y:minY+fh*.08,w:fw*.5,h:fh*.18};ctx.strokeStyle="#52e7c0";ctx.lineWidth=Math.max(3,c.width/180);ctx.setLineDash([18,12]);ctx.strokeRect(minX,minY,fw,fh);ctx.setLineDash([]);ctx.strokeStyle="#d7ff62";ctx.strokeRect(roi.x,roi.y,roi.w,roi.h);if(!sampler.current)sampler.current=document.createElement("canvas");const sc=sampler.current;sc.width=32;sc.height=16;const sx=sc.getContext("2d",{willReadFrequently:true})!;sx.drawImage(v,roi.x,roi.y,roi.w,roi.h,0,0,32,16);const data=sx.getImageData(0,0,32,16).data;let r=0,g=0,b=0,n=0;for(let i=0;i<data.length;i+=4){r+=data[i];g+=data[i+1];b+=data[i+2];n++}r/=n;g/=n;b/=n;const scores=new Map((result.faceBlendshapes[0]?.categories??[]).map(x=>[x.categoryName,x.score])),q=(name:string)=>scores.get(name)??0,smile=(q("mouthSmileLeft")+q("mouthSmileRight"))/2,frown=(q("mouthFrownLeft")+q("mouthFrownRight"))/2,brow=(q("browDownLeft")+q("browDownRight"))/2,wide=(q("eyeWideLeft")+q("eyeWideRight"))/2,open=q("jawOpen"),fv=clamp(smile*1.45-frown*1.15-brow*.35,-1,1),fa=clamp(open*.6+wide*.4+q("browInnerUp")*.22+q("mouthFunnel")*.18,0,1),label=smile>.35?"smile":frown>.3?"frown":open>.35||wide>.3?"alert":"neutral",t=Date.now();setFace(true);setStatus("Face detected · Analyzing");setValence(fv);setFacial(fa);setExpression(label);rgb.current.push({t,r,g,b});rgb.current=rgb.current.filter(x=>t-x.t<=32000);emotions.current.push({t,v:fv,a:fa,label});emotions.current=emotions.current.filter(x=>t-x.t<=32000)};raf=requestAnimationFrame(tick);return()=>cancelAnimationFrame(raf)},[running]);
+useEffect(()=>{if(!running)return;const began=Date.now(),id=setInterval(()=>{const e=Math.floor((Date.now()-began)/1000),z=pulse(rgb.current),p=z.hr==null?null:clamp(Math.round(35+Math.abs(z.hr-70)*.8),0,100);setElapsed(e);setHr(z.hr);setQuality(z.q);setWave(z.w);setHz(z.hz);setPhys(z.q==="Poor"?null:p);if(e>0&&e%30===0)setRows(old=>{if(old.at(-1)?.window_number===e/30)return old;const es=emotions.current,vs=es.map(x=>x.v),as=es.map(x=>x.a);return[...old,{timestamp:new Date().toISOString(),window_number:e/30,estimated_HR:z.hr,physiological_arousal_index:z.q==="Poor"?null:p,signal_quality:z.q,valence_mean:vs.length?m(vs):null,valence_sd:vs.length?s(vs):null,facial_arousal_mean:as.length?m(as):null,facial_arousal_sd:as.length?s(as):null}].slice(-40)})},1000);return()=>clearInterval(id)},[running]);const csv=()=>{const h=["timestamp","window_number","estimated_HR","physiological_arousal_index","signal_quality","valence_mean","valence_sd","facial_arousal_mean","facial_arousal_sd"],lines=[h.join(","),...rows.map(x=>h.map(k=>String(x[k as keyof Row]??"")).join(","))],a=document.createElement("a");a.href=URL.createObjectURL(new Blob([lines.join("\n")],{type:"text/csv"}));a.download=`pulse-lens-${new Date().toISOString().slice(0,10)}.csv`;a.click();URL.revokeObjectURL(a.href)};const chart=useMemo(()=>rows.map(x=>x.physiological_arousal_index??0),[rows]);
+return <main><header><div className="brand"><span className="mark">P</span><div><strong>Pulse Lens</strong><small>CAMERA PHYSIO LAB</small></div></div><button className="icon-btn" onClick={()=>setDebug(x=>!x)}>DEBUG {debug?"ON":"OFF"}</button></header><section className="hero"><div><p className="eyebrow">LIVE · ON-DEVICE ANALYSIS</p><h1>Your signals,<br/><em>made visible.</em></h1><p className="intro">An experimental lens on pulse dynamics and facial expression—processed privately in your browser.</p></div><div className="privacy"><span>●</span> Video stays on this device</div></section><section className="camera-card"><div className="camera-stage"><video ref={video} muted playsInline/><canvas ref={canvas}/>{!running&&<div className="camera-empty"><span>◎</span><b>Ready when you are</b><small>Position your full face in natural, steady light</small></div>}<div className={`status ${face?"ok":""}`}><i/>{status}</div><div className="roi-label">FOREHEAD ROI</div></div><div className="camera-actions"><button className="primary" onClick={running?stop:start}>{running?"Stop session":"Start camera"}</button><span>{running?`${String(Math.floor(elapsed/60)).padStart(2,"0")}:${String(elapsed%60).padStart(2,"0")}`:"Local processing"}</span></div></section><section className="section-head"><div><p className="eyebrow">CURRENT READINGS</p><h2>Live signals</h2></div><div className={`quality q-${quality.toLowerCase()}`}>{quality} signal</div></section><section className="metrics"><article className="metric featured"><label>ESTIMATED HEART RATE</label><div><strong>{f(hr)}</strong><span>bpm</span></div><Trace v={wave}/><small>{quality==="Poor"?"Insufficient signal — hold still in even light":"POS-derived pulse estimate"}</small></article><article className="metric"><label>PHYSIOLOGICAL AROUSAL</label><div><strong>{f(phys)}</strong><span>/ 100</span></div><div className="meter"><i style={{width:`${phys??0}%`}}/></div><small>Experimental index · not stress</small></article><article className="metric"><label>FACIAL VALENCE</label><div><strong>{f(valence,2)}</strong></div><small>{modelStatus}</small></article><article className="metric"><label>FACIAL AROUSAL</label><div><strong>{f(facial,2)}</strong></div><small>{expression} · landmark-based</small></article></section><section className="window"><div><p className="eyebrow">30-SECOND WINDOW</p><h2>Expression dynamics</h2></div><div className="countdown"><span>{running?next:30}</span><small>SEC TO NEXT<br/>ANALYSIS</small></div><div className="window-grid">{[["Valence mean",rows.at(-1)?.valence_mean],["Valence SD",rows.at(-1)?.valence_sd],["Arousal mean",rows.at(-1)?.facial_arousal_mean],["Arousal SD",rows.at(-1)?.facial_arousal_sd]].map(([l,v])=><div key={l as string}><label>{l}</label><b>{f(v as number|null,2)}</b></div>)}</div><p className="unavailable">Values are derived locally from face-landmark blendshapes (smile, frown, eye widening, jaw opening); they describe visible facial movement, not internal emotion.</p></section><section className="history"><div className="section-head"><div><p className="eyebrow">SESSION HISTORY</p><h2>Window timeline</h2></div><button className="secondary" onClick={csv} disabled={!rows.length}>Export CSV</button></div><div className="chart"><Trace v={chart} c="#d7ff62"/>{!rows.length&&<p>Completed 30-second windows will appear here.</p>}</div></section>{debug&&<section className="debug"><p className="eyebrow">RESEARCH DEBUG</p><h2>Signal inspector</h2><div className="debug-grid"><div><label>FPS</label><b>{fps}</b></div><div><label>Face landmarks</label><b>{face?"active":"—"}</b></div><div><label>Samples</label><b>{rgb.current.length}</b></div><div><label>Dominant frequency</label><b>{hz?`${hz.toFixed(2)} Hz`:"—"}</b></div><div><label>Signal quality</label><b>{quality}</b></div><div><label>Facial state</label><b>{expression}</b></div></div><Trace v={wave}/></section>}<footer><p>Experimental research/education demo. Not a medical or diagnostic device.</p><small>Video and face landmarks are processed locally. Camera-derived signals are sensitive to lighting, movement, skin visibility, camera quality and frame rate.</small></footer></main>}
